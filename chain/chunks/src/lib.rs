@@ -42,6 +42,7 @@ use near_primitives::{checked_feature, unwrap_or_return};
 
 use crate::chunk_cache::{EncodedChunksCache, EncodedChunksCacheEntry};
 pub use crate::types::Error;
+use crate::types::{ExpiryIndex, StandardTimeProvider, TimeProvider};
 use rand::Rng;
 
 mod chunk_cache;
@@ -54,10 +55,9 @@ pub const CHUNK_REQUEST_SWITCH_TO_OTHERS_MS: u64 = 400;
 pub const CHUNK_REQUEST_SWITCH_TO_FULL_FETCH_MS: u64 = 3_000;
 const CHUNK_REQUEST_RETRY_MAX_MS: u64 = 100_000;
 const CHUNK_FORWARD_CACHE_SIZE: usize = 1000;
-const ACCEPTING_SEAL_PERIOD_MS: i64 = 30_000;
+const ACCEPTING_SEAL_PERIOD_MS: i64 = 60_000;
 const NUM_PARTS_REQUESTED_IN_SEAL: usize = 3;
-// TODO(#3180): seals are disabled in single shard setting
-// const NUM_PARTS_LEFT_IN_SEAL: usize = 1;
+const NUM_PARTS_LEFT_IN_SEAL: usize = 1;
 const PAST_SEAL_HEIGHT_HORIZON: BlockHeightDelta = 1024;
 
 #[derive(PartialEq, Eq)]
@@ -72,7 +72,10 @@ pub enum ProcessPartialEncodedChunkResult {
     Known,
     /// The CryptoHash is the previous block hash (which might be unknown to the caller) to start
     ///     unblocking the blocks from
-    HaveAllPartsAndReceipts(CryptoHash),
+    HaveAllPartsAndReceipts {
+        prev_block_hash: CryptoHash,
+        demurs_remain: bool,
+    },
     /// The Header is the header of the current chunk, which is unknown to the caller, to request
     ///     parts / receipts for
     NeedMorePartsOrReceipts,
@@ -82,7 +85,7 @@ pub enum ProcessPartialEncodedChunkResult {
 }
 
 #[derive(Clone, Debug)]
-struct ChunkRequestInfo {
+pub(crate) struct ChunkRequestInfo {
     height: BlockHeight,
     parent_hash: CryptoHash,
     shard_id: ShardId,
@@ -90,7 +93,7 @@ struct ChunkRequestInfo {
     last_requested: Instant,
 }
 
-struct RequestPool {
+pub(crate) struct RequestPool {
     retry_duration: Duration,
     switch_to_others_duration: Duration,
     switch_to_full_fetch_duration: Duration,
@@ -161,24 +164,17 @@ struct ActiveSealDemur {
 }
 
 impl Seal<'_> {
-    // TODO(#3180): seals are disabled in single shard setting
-    /*fn process(self, chunk_entry: &EncodedChunksCacheEntry) -> bool {
-        match self {
-            Seal::Past => true,
-            Seal::Active(demur) => {
-                let mut res = true;
-                demur.part_ords.retain(|part_ord| {
-                    if !chunk_entry.parts.contains_key(&part_ord) {
-                        res = false;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                res
+    // Removes the given parts from the seal, then returns whether parts still remain
+    // (i.e. returns true when more parts still need to be received and false other wise).
+    fn remove_part_ords<'a, I: IntoIterator<Item = &'a u64>>(self, parts: I) -> bool {
+        if let Seal::Active(demur) = self {
+            for ord in parts {
+                demur.part_ords.remove(ord);
             }
+            return demur.part_ords.len() > NUM_PARTS_LEFT_IN_SEAL;
         }
-    }*/
+        false
+    }
 
     fn contains_part_ord(&self, part_ord: &u64) -> bool {
         match self {
@@ -188,24 +184,44 @@ impl Seal<'_> {
     }
 }
 
-pub struct SealsManager {
+pub struct SealsManager<T: TimeProvider> {
     me: Option<AccountId>,
     runtime_adapter: Arc<dyn RuntimeAdapter>,
 
     active_demurs: HashMap<ChunkHash, ActiveSealDemur>,
     past_seals: BTreeMap<BlockHeight, HashSet<ChunkHash>>,
     dont_include_chunks_from: SizedCache<AccountId, ()>,
+    // A structure to enable efficient removal of seals that have expired.
+    // Note: in a previous version of the code we simply iterated over all
+    // active demurs, but this is not acceptable.
+    expiry_index: ExpiryIndex,
+    // A type to determine the current time. Previously we simply used
+    // `Utc::now`, however it has now been extracted to allow inserting seals
+    // with specific times in the tests (the abstraction enables this nicely
+    // because we can use a mock instance of `TimeProvider` where we have full
+    // control over the time returned).
+    time_provider: T,
 }
 
-impl SealsManager {
-    fn new(me: Option<AccountId>, runtime_adapter: Arc<dyn RuntimeAdapter>) -> Self {
+impl<T: TimeProvider> SealsManager<T> {
+    fn new(
+        me: Option<AccountId>,
+        runtime_adapter: Arc<dyn RuntimeAdapter>,
+        time_provider: T,
+    ) -> Self {
         Self {
             me,
             runtime_adapter,
             active_demurs: HashMap::new(),
             past_seals: BTreeMap::new(),
             dont_include_chunks_from: SizedCache::with_size(CHUNK_PRODUCER_BLACKLIST_SIZE),
+            expiry_index: ExpiryIndex::default(),
+            time_provider,
         }
+    }
+
+    fn has_active_demur(&self, chunk_hash: &ChunkHash) -> bool {
+        self.active_demurs.contains_key(chunk_hash)
     }
 
     fn get_seal(
@@ -261,8 +277,16 @@ impl SealsManager {
                 };
 
                 let chosen = Self::get_random_part_ords(candidates);
-                let demur =
-                    ActiveSealDemur { part_ords: chosen, chunk_producer, sent: Utc::now(), height };
+                let sent_timestamp = self.time_provider.now();
+                let expiry_timestamp =
+                    sent_timestamp + chrono::Duration::milliseconds(ACCEPTING_SEAL_PERIOD_MS);
+                let demur = ActiveSealDemur {
+                    part_ords: chosen,
+                    chunk_producer,
+                    sent: sent_timestamp,
+                    height,
+                };
+                self.expiry_index.insert(expiry_timestamp, chunk_hash.clone());
 
                 Ok(entry.insert(demur))
             }
@@ -284,13 +308,12 @@ impl SealsManager {
         match maybe_seal {
             None => match self.past_seals.entry(height) {
                 btree_map::Entry::Vacant(vacant) => {
-                    // TODO(#3180): seals are disabled in single shard setting
-                    /*warn!(
+                    warn!(
                         target: "chunks",
                         "A chunk at height {} with hash {:?} was approved without an active seal demur and no past seals were found at the same height",
                         height,
                         chunk_hash
-                    );*/
+                    );
                     let mut hashes = HashSet::new();
                     hashes.insert(chunk_hash.clone());
                     vacant.insert(hashes);
@@ -298,18 +321,22 @@ impl SealsManager {
                 btree_map::Entry::Occupied(mut occupied) => {
                     let hashes = occupied.get_mut();
                     if !hashes.contains(chunk_hash) {
-                        // TODO(#3180): seals are disabled in single shard setting
-                        /*warn!(
+                        warn!(
                             target: "chunks",
                             "Approved chunk at height {} with hash {:?} was not an active seal demur or a past seal",
                             height,
                             chunk_hash
-                        );*/
+                        );
                         hashes.insert(chunk_hash.clone());
                     }
                 }
             },
             Some(seal) => {
+                // Note: we purposely do not update the expiry_index here because it is
+                // unnecessary. The seal has already been removed from active_demurs, so
+                // when the corresponding expiry_index entry is removed nothing will happen
+                // (the `if let` will not match). The reason to not update expiry_index is
+                // because there is not an efficient way to pick out a specific chunk hash.
                 Self::insert_past_seal(&mut self.past_seals, seal.height, chunk_hash.clone());
             }
         }
@@ -324,8 +351,7 @@ impl SealsManager {
         hashes_at_height.insert(chunk_hash);
     }
 
-    // TODO(#3180): seals are disabled in single shard setting
-    /*fn prune_past_seals(&mut self) {
+    fn prune_past_seals(&mut self) {
         let maybe_height_limits = {
             let mut heights = self.past_seals.keys();
             heights.next().and_then(|least_height| {
@@ -340,37 +366,70 @@ impl SealsManager {
                 self.past_seals = remaining_seals;
             }
         }
-    }*/
+    }
 
-    // TODO(#3180): seals are disabled in single shard setting
-    /*fn track_seals(&mut self) {
-        let now = Utc::now();
+    fn check_seals_expired(&mut self, requested_chunks: &mut RequestPool) {
         let me = &self.me;
         let dont_include_chunks_from = &mut self.dont_include_chunks_from;
         let past_seals = &mut self.past_seals;
 
-        self.active_demurs.retain(|chunk_hash, seal| {
-            let accepting_period_over = (now - seal.sent).num_milliseconds() > ACCEPTING_SEAL_PERIOD_MS;
-            let parts_remain = seal.part_ords.len() > NUM_PARTS_LEFT_IN_SEAL;
-
-            // note chunk producers that failed to make parts available
-            if parts_remain && accepting_period_over {
+        let now = self.time_provider.now();
+        let mut expired_entry = self.expiry_index.pop_before(&now);
+        while expired_entry.is_some() {
+            let (_, chunk_hash) = expired_entry.unwrap();
+            // Note: we purposely do nothing in the `None` case because we do
+            // not remove entries from expiry_index except in this function.
+            // If a seal was fulfilled before expiring (the expected common case)
+            // then it will already have been removed from `active_demurs`.
+            if let Some(seal) = self.active_demurs.remove(&chunk_hash) {
+                // Entries in active_demurs have parts remaining
+                debug_assert!(seal.part_ords.len() > NUM_PARTS_LEFT_IN_SEAL);
+                // This seal has parts remaining and is past its expiry, so we
+                // record the chunk producer that failed to make parts available and
+                // move the seal to the past_seals set. We also stop requesting
+                // this chunk since we assume the seal failure means it is unavailable.
+                requested_chunks.remove(&chunk_hash);
                 warn!(target: "client", "Couldn't reconstruct chunk {:?} from {:?}, I'm {:?}", chunk_hash, seal.chunk_producer, me);
-                dont_include_chunks_from.cache_set(seal.chunk_producer.clone(), ());
-                Self::insert_past_seal(past_seals, seal.height, chunk_hash.clone());
-
-                // Do not retain this demur, it has expired
-                false
-            } else {
-                true
+                dont_include_chunks_from.cache_set(seal.chunk_producer, ());
+                Self::insert_past_seal(past_seals, seal.height, chunk_hash);
             }
-        });
-
-        self.prune_past_seals();
-    }*/
+            expired_entry = self.expiry_index.pop_before(&now);
+        }
+    }
 
     fn should_trust_chunk_producer(&mut self, chunk_producer: &AccountId) -> bool {
         self.dont_include_chunks_from.cache_get(chunk_producer).is_none()
+    }
+
+    pub(crate) fn process_seals<'a, I>(
+        &mut self,
+        requested_chunks: &mut RequestPool,
+        chunk_hash: &ChunkHash,
+        parent_hash: &CryptoHash,
+        height: BlockHeight,
+        shard_id: ShardId,
+        parts: I,
+        chunk_known: bool,
+    ) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = &'a u64>,
+    {
+        let seal = self.get_seal(chunk_hash, parent_hash, height, shard_id)?;
+        let parts_remain = seal.remove_part_ords(parts);
+        if !parts_remain {
+            // Have enough parts to fulfil the seal, remove from the active Demurs
+
+            // If the other required chunk parts are known then we can remove
+            // the request as well.
+            if chunk_known {
+                requested_chunks.remove(chunk_hash);
+            }
+
+            self.approve_chunk(height, chunk_hash);
+        }
+        self.check_seals_expired(requested_chunks);
+        self.prune_past_seals();
+        Ok(())
     }
 }
 
@@ -387,7 +446,7 @@ pub struct ShardsManager {
     stored_partial_encoded_chunks: HashMap<BlockHeight, HashMap<ShardId, PartialEncodedChunkV2>>,
     chunk_forwards_cache: SizedCache<ChunkHash, HashMap<u64, PartialEncodedChunkPart>>,
 
-    seals_mgr: SealsManager,
+    seals_mgr: SealsManager<StandardTimeProvider>,
 }
 
 impl ShardsManager {
@@ -410,7 +469,7 @@ impl ShardsManager {
             ),
             stored_partial_encoded_chunks: HashMap::new(),
             chunk_forwards_cache: SizedCache::with_size(CHUNK_FORWARD_CACHE_SIZE),
-            seals_mgr: SealsManager::new(me, runtime_adapter),
+            seals_mgr: SealsManager::new(me, runtime_adapter, StandardTimeProvider),
         }
     }
 
@@ -972,6 +1031,18 @@ impl ShardsManager {
         }
     }
 
+    fn validate_parts<'a, I>(&mut self, merkle_root: MerkleHash, parts: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = &'a PartialEncodedChunkPart>,
+    {
+        let num_total_parts = self.runtime_adapter.num_total_parts();
+        for part_info in parts {
+            // TODO(#3662): only validate parts we care about
+            self.validate_part(merkle_root, part_info, num_total_parts)?;
+        }
+        Ok(())
+    }
+
     pub fn decode_and_persist_encoded_chunk_if_complete(
         &mut self,
         mut encoded_chunk: EncodedShardChunk,
@@ -1004,10 +1075,7 @@ impl ShardsManager {
         }
 
         // check part merkle proofs
-        let num_total_parts = self.runtime_adapter.num_total_parts();
-        for part_info in forward.parts.iter() {
-            self.validate_part(forward.merkle_root, part_info, num_total_parts)?;
-        }
+        self.validate_parts(forward.merkle_root, forward.parts.iter())?;
 
         // check signature
         let valid_signature = self.runtime_adapter.verify_chunk_signature_with_header_parts(
@@ -1081,6 +1149,23 @@ impl ShardsManager {
         }
     }
 
+    pub fn process_seals(
+        &mut self,
+        received_chunk: &PartialEncodedChunkV2,
+        chunk_known: bool,
+    ) -> Result<(), Error> {
+        let header = &received_chunk.header;
+        self.seals_mgr.process_seals(
+            &mut self.requested_partial_encoded_chunks,
+            &header.chunk_hash(),
+            &header.prev_block_hash(),
+            header.height_created(),
+            header.shard_id(),
+            received_chunk.parts.iter().map(|p| &p.part_ord),
+            chunk_known,
+        )
+    }
+
     pub fn process_partial_encoded_chunk(
         &mut self,
         partial_encoded_chunk: MaybeValidated<&PartialEncodedChunkV2>,
@@ -1138,6 +1223,14 @@ impl ShardsManager {
                     .all(|receipt| entry.receipts.contains_key(&receipt.1.to_shard_id));
 
                 if know_all_receipts {
+                    if self.seals_mgr.has_active_demur(&chunk_hash) {
+                        // Check the validity of the parts, then use them for the seal
+                        self.validate_parts(
+                            header.encoded_merkle_root(),
+                            partial_encoded_chunk.parts.iter(),
+                        )?;
+                        self.process_seals(&partial_encoded_chunk, true)?;
+                    }
                     return Ok(ProcessPartialEncodedChunkResult::Known);
                 }
             }
@@ -1173,11 +1266,7 @@ impl ShardsManager {
         };
 
         // 5. Checking part_ords' validity
-        let num_total_parts = self.runtime_adapter.num_total_parts();
-        for part_info in partial_encoded_chunk.parts.iter() {
-            // TODO: only validate parts we care about
-            self.validate_part(header.encoded_merkle_root(), part_info, num_total_parts)?;
-        }
+        self.validate_parts(header.encoded_merkle_root(), partial_encoded_chunk.parts.iter())?;
 
         // 6. Checking receipts validity
         for proof in partial_encoded_chunk.receipts.iter() {
@@ -1213,6 +1302,7 @@ impl ShardsManager {
         store_update.commit()?;
 
         self.encoded_chunks.merge_in_partial_encoded_chunk(partial_encoded_chunk);
+        self.process_seals(partial_encoded_chunk, false)?;
 
         // Forward my parts to others tracking this chunk's shard
         checked_feature!(
@@ -1237,22 +1327,10 @@ impl ShardsManager {
             header.shard_id(),
         )?;
 
-        // TODO(#3180): seals are disabled in single shard setting
-        // self.seals_mgr.track_seals();
-
         if have_all_parts && self.seals_mgr.should_trust_chunk_producer(&chunk_producer) {
             self.encoded_chunks.insert_chunk_header(header.shard_id(), header.clone());
         }
         let entry = self.encoded_chunks.get(&chunk_hash).unwrap();
-
-        // TODO(#3180): seals are disabled in single shard setting
-        /*let seal = self.seals_mgr.get_seal(
-            &chunk_hash,
-            &prev_block_hash,
-            header.inner.height_created,
-            header.inner.shard_id,
-        )?;
-        let have_all_seal = seal.process(entry);*/
 
         if have_all_parts && have_all_receipts {
             let cares_about_shard = self.cares_about_shard_this_or_next_epoch(
@@ -1273,11 +1351,17 @@ impl ShardsManager {
             // If we do care about the shard, we will remove the request once the full chunk is
             //    assembled.
             if !cares_about_shard {
+                let demurs_remain = self.seals_mgr.has_active_demur(&chunk_hash);
                 self.encoded_chunks.remove_from_cache_if_outside_horizon(&chunk_hash);
-                self.requested_partial_encoded_chunks.remove(&chunk_hash);
-                return Ok(ProcessPartialEncodedChunkResult::HaveAllPartsAndReceipts(
+                // We can only remove this from requested chunks if there are not parts
+                // we are waiting for to fulfil demurs.
+                if !demurs_remain {
+                    self.requested_partial_encoded_chunks.remove(&chunk_hash);
+                }
+                return Ok(ProcessPartialEncodedChunkResult::HaveAllPartsAndReceipts {
                     prev_block_hash,
-                ));
+                    demurs_remain,
+                });
             }
         }
 
@@ -1303,7 +1387,11 @@ impl ShardsManager {
 
             self.encoded_chunks.remove_from_cache_if_outside_horizon(&chunk_hash);
             self.requested_partial_encoded_chunks.remove(&chunk_hash);
-            return Ok(ProcessPartialEncodedChunkResult::HaveAllPartsAndReceipts(prev_block_hash));
+            // We know there is no demur for this chunk now that we reconstructed it
+            return Ok(ProcessPartialEncodedChunkResult::HaveAllPartsAndReceipts {
+                prev_block_hash,
+                demurs_remain: false,
+            });
         }
 
         match self.chunk_forwards_cache.cache_remove(&chunk_hash) {
@@ -1863,7 +1951,7 @@ mod test {
         let fixture = SealsManagerTestFixture::default();
         let mut seals_manager = fixture.create_seals_manager();
 
-        let seal_assert = |seals_manager: &mut SealsManager| {
+        let seal_assert = |seals_manager: &mut SealsManager<MockTimeProvider>| {
             let seal = seals_manager
                 .get_seal(
                     &fixture.mock_chunk_hash,
@@ -1911,12 +1999,56 @@ mod test {
             .contains(&fixture.mock_chunk_hash));
     }
 
-    // TODO(#3180): seals are disabled in single shard setting
-    /*#[test]
-    fn test_track_seals() {
+    #[test]
+    fn test_process_seals() {
         let fixture = SealsManagerTestFixture::default();
         let mut seals_manager = fixture.create_seals_manager();
+        let create_request_pool = || -> RequestPool {
+            let mut requested_chunks = RequestPool::new(
+                Duration::from_millis(CHUNK_REQUEST_RETRY_MS),
+                Duration::from_millis(CHUNK_REQUEST_SWITCH_TO_OTHERS_MS),
+                Duration::from_millis(CHUNK_REQUEST_SWITCH_TO_FULL_FETCH_MS),
+                Duration::from_millis(CHUNK_REQUEST_RETRY_MAX_MS),
+            );
 
+            let chunk_info = ChunkRequestInfo {
+                height: fixture.mock_height,
+                parent_hash: fixture.mock_parent_hash.clone(),
+                shard_id: fixture.mock_shard_id,
+                added: Instant::now(),
+                last_requested: Instant::now(),
+            };
+            requested_chunks.insert(fixture.mock_chunk_hash.clone(), chunk_info);
+
+            requested_chunks
+        };
+
+        // SealsManager::process_seals should:
+
+        // 1 a. Move seals that have received enough parts from active to past
+        let mut requested_chunks = create_request_pool();
+        test_seal_success_common(&mut seals_manager, &mut requested_chunks, &fixture, false);
+        assert!(requested_chunks.contains_key(&fixture.mock_chunk_hash));
+        assert!(seals_manager.active_demurs.is_empty());
+        assert!(seals_manager.should_trust_chunk_producer(&fixture.mock_chunk_producer));
+        assert!(seals_manager
+            .past_seals
+            .get(&fixture.mock_height)
+            .unwrap()
+            .contains(&fixture.mock_chunk_hash));
+
+        // 1 b. Remove the chunk hash from the request pool if the chunk is known
+        seals_manager = fixture.create_seals_manager();
+        let mut requested_chunks = create_request_pool();
+        test_seal_success_common(&mut seals_manager, &mut requested_chunks, &fixture, true);
+        assert!(!requested_chunks.contains_key(&fixture.mock_chunk_hash));
+
+        // 2. mark the chunk producer as faulty if the parts were not retrieved and
+        //    move the seal into the past seals map
+
+        // reset the seals manager to test case where the parts were not received
+        seals_manager = fixture.create_seals_manager();
+        requested_chunks = create_request_pool();
         // create a seal with old timestamp
         fixture.create_expired_seal(
             &mut seals_manager,
@@ -1924,12 +2056,19 @@ mod test {
             &fixture.mock_parent_hash,
             fixture.mock_height,
         );
-
-        // SealsManager::track_seals should:
-
-        // 1. mark the chunk producer as faulty if the parts were not retrieved and
-        //    move the seal into the past seals map
-        seals_manager.track_seals();
+        seals_manager
+            .process_seals(
+                &mut requested_chunks,
+                &fixture.mock_chunk_hash,
+                &fixture.mock_parent_hash,
+                fixture.mock_height,
+                fixture.mock_shard_id,
+                Vec::new().iter(),
+                false,
+            )
+            .unwrap();
+        // We should not request expired seals any more
+        assert!(!requested_chunks.contains_key(&fixture.mock_chunk_hash));
         assert!(!seals_manager.should_trust_chunk_producer(&fixture.mock_chunk_producer));
         assert!(seals_manager.active_demurs.is_empty());
         assert!(seals_manager
@@ -1938,17 +2077,81 @@ mod test {
             .unwrap()
             .contains(&fixture.mock_chunk_hash));
 
-        // 2. remove seals older than the USED_SEAL_HEIGHT_HORIZON
+        // 3. remove seals older than the PAST_SEAL_HEIGHT_HORIZON
         fixture.create_expired_seal(
             &mut seals_manager,
             &fixture.mock_distant_chunk_hash,
             &fixture.mock_distant_block_hash,
             fixture.mock_height + PAST_SEAL_HEIGHT_HORIZON + 1,
         );
-        seals_manager.track_seals();
+        seals_manager
+            .process_seals(
+                &mut requested_chunks,
+                &fixture.mock_chunk_hash,
+                &fixture.mock_parent_hash,
+                fixture.mock_height,
+                fixture.mock_shard_id,
+                Vec::new().iter(),
+                false,
+            )
+            .unwrap();
         assert!(seals_manager.active_demurs.is_empty());
         assert!(seals_manager.past_seals.get(&fixture.mock_height).is_none());
-    }*/
+
+        // 4. Do nothing if no seals are expired or fulfilled
+        seals_manager = fixture.create_seals_manager();
+        requested_chunks = create_request_pool();
+        fixture.create_seal(&mut seals_manager);
+        seals_manager
+            .process_seals(
+                &mut requested_chunks,
+                &fixture.mock_chunk_hash,
+                &fixture.mock_parent_hash,
+                fixture.mock_height,
+                fixture.mock_shard_id,
+                [0].iter(),
+                false,
+            )
+            .unwrap();
+        assert!(requested_chunks.contains_key(&fixture.mock_chunk_hash));
+        assert!(seals_manager.should_trust_chunk_producer(&fixture.mock_chunk_producer));
+        assert!(seals_manager.past_seals.is_empty());
+        assert!(seals_manager.active_demurs.contains_key(&fixture.mock_chunk_hash));
+    }
+
+    fn test_seal_success_common<T: TimeProvider>(
+        seals_manager: &mut SealsManager<T>,
+        requested_chunks: &mut RequestPool,
+        fixture: &SealsManagerTestFixture,
+        chunk_known: bool,
+    ) {
+        fixture.create_seal(seals_manager);
+        let seal = seals_manager
+            .get_seal(
+                &fixture.mock_chunk_hash,
+                &fixture.mock_parent_hash,
+                fixture.mock_height,
+                fixture.mock_shard_id,
+            )
+            .unwrap();
+        let received_parts: Vec<u64> = match seal {
+            Seal::Active(ref demur) => {
+                demur.part_ords.iter().skip(NUM_PARTS_LEFT_IN_SEAL).copied().collect()
+            }
+            Seal::Past => panic!("Should have produced an active seal"),
+        };
+        seals_manager
+            .process_seals(
+                requested_chunks,
+                &fixture.mock_chunk_hash,
+                &fixture.mock_parent_hash,
+                fixture.mock_height,
+                fixture.mock_shard_id,
+                received_parts.iter(),
+                chunk_known,
+            )
+            .unwrap();
+    }
 
     #[cfg(feature = "protocol_feature_forward_chunk_parts")]
     #[test]
@@ -2043,7 +2246,7 @@ mod test {
             .unwrap();
 
         match result {
-            ProcessPartialEncodedChunkResult::HaveAllPartsAndReceipts(_) => (),
+            ProcessPartialEncodedChunkResult::HaveAllPartsAndReceipts { .. } => (),
             other_result => panic!("Expected HaveAllPartsAndReceipts, but got {:?}", other_result),
         }
         // No requests should have been sent since all the required parts were contained in the

@@ -820,7 +820,18 @@ impl Client {
 
                 match process_result {
                     ProcessPartialEncodedChunkResult::Known => Ok(vec![]),
-                    ProcessPartialEncodedChunkResult::HaveAllPartsAndReceipts(_) => {
+                    ProcessPartialEncodedChunkResult::HaveAllPartsAndReceipts {
+                        demurs_remain,
+                        ..
+                    } => {
+                        if demurs_remain {
+                            let chunk_header = pec_v2.extract().header;
+                            self.shards_mgr.request_chunks(
+                                iter::once(chunk_header),
+                                &self.chain.header_head()?,
+                                protocol_version,
+                            );
+                        }
                         self.chain.blocks_with_missing_chunks.accept_chunk(&chunk_hash);
                         Ok(self.process_blocks_with_missing_chunks(protocol_version))
                     }
