@@ -2,6 +2,7 @@ use crate::errors::IntoVMError;
 use crate::memory::WasmerMemory;
 use crate::{cache, imports};
 use near_primitives::runtime::fees::RuntimeFeesConfig;
+use near_primitives::runtime::in_memory_contract::InMemoryContracts;
 use near_primitives::{
     config::VMConfig, profile::ProfileData, types::CompiledContractCache, version::ProtocolVersion,
 };
@@ -189,6 +190,7 @@ pub fn run_wasmer<'a>(
     profile: Option<ProfileData>,
     current_protocol_version: ProtocolVersion,
     cache: Option<&'a dyn CompiledContractCache>,
+    in_mem_contract: InMemoryContracts,
 ) -> (Option<VMOutcome>, Option<VMError>) {
     if !cfg!(target_arch = "x86") && !cfg!(target_arch = "x86_64") {
         // TODO(#1940): Remove once NaN is standardized by the VM.
@@ -210,7 +212,14 @@ pub fn run_wasmer<'a>(
     }
 
     // TODO: consider using get_module() here, once we'll go via deployment path.
-    let module = match cache::compile_module_cached_wasmer(&code_hash, code, wasm_config, cache) {
+    let module = match cache::compile_module_cached_wasmer(
+        &code_hash,
+        code,
+        wasm_config,
+        cache,
+        &context.current_account_id,
+        in_mem_contract,
+    ) {
         Ok(x) => x,
         Err(err) => return (None, Some(err)),
     };

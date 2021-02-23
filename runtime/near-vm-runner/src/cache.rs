@@ -4,6 +4,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 #[cfg(not(feature = "no_cache"))]
 use cached::{cached_key, SizedCache};
 use near_primitives::hash::CryptoHash;
+use near_primitives::runtime::in_memory_contract::InMemoryContracts;
+use near_primitives::types::AccountId;
 use near_primitives::types::CompiledContractCache;
 use near_vm_errors::CacheError::{DeserializationError, ReadError, SerializationError, WriteError};
 use near_vm_errors::{CacheError, VMError};
@@ -140,10 +142,26 @@ pub(crate) fn compile_module_cached_wasmer(
     wasm_code: &[u8],
     config: &VMConfig,
     cache: Option<&dyn CompiledContractCache>,
+    account_id: &AccountId,
+    in_mem_contract: InMemoryContracts,
 ) -> Result<wasmer_runtime::Module, VMError> {
     let key = get_key(wasm_code_hash, wasm_code, VMKind::Wasmer, config);
-    #[cfg(not(feature = "no_cache"))]
-    return memcache_compile_module_cached_wasmer(key, wasm_code, config, cache);
-    #[cfg(feature = "no_cache")]
-    return compile_module_cached_wasmer_impl(key, wasm_code, config, cache);
+    match in_mem_contract.get(account_id, &key) {
+        Some(Some(r)) => r,
+        Some(None) => {
+            #[cfg(not(feature = "no_cache"))]
+            let r = memcache_compile_module_cached_wasmer(key.clone(), wasm_code, config, cache);
+
+            #[cfg(feature = "no_cache")]
+            let r = compile_module_cached_wasmer_impl(key.clone(), wasm_code, config, cache);
+            in_mem_contract.set(account_id.into(), key, r.clone());
+            r
+        }
+        None => {
+            #[cfg(not(feature = "no_cache"))]
+            return memcache_compile_module_cached_wasmer(key, wasm_code, config, cache);
+            #[cfg(feature = "no_cache")]
+            return compile_module_cached_wasmer_impl(key, wasm_code, config, cache);
+        }
+    }
 }

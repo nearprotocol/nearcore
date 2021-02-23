@@ -57,6 +57,7 @@ use node_runtime::{
 
 use crate::shard_tracker::{account_id_to_shard_id, ShardTracker};
 use near_primitives::runtime::config::RuntimeConfig;
+use near_primitives::runtime::in_memory_contract::InMemoryContracts;
 
 #[cfg(feature = "protocol_feature_rectify_inflation")]
 use near_epoch_manager::NUM_SECONDS_IN_A_YEAR;
@@ -128,6 +129,7 @@ pub struct NightshadeRuntime {
     genesis_runtime_config: Arc<RuntimeConfig>,
 
     store: Arc<Store>,
+    in_memory_contracts_per_shard: Vec<InMemoryContracts>,
     tries: ShardTries,
     trie_viewer: TrieViewer,
     pub runtime: Runtime,
@@ -143,6 +145,7 @@ impl NightshadeRuntime {
         genesis: &Genesis,
         initial_tracking_accounts: Vec<AccountId>,
         initial_tracking_shards: Vec<ShardId>,
+        always_in_mem_contracts: &Vec<AccountId>,
     ) -> Self {
         let runtime = Runtime::new();
         let trie_viewer = TrieViewer::new();
@@ -183,10 +186,8 @@ impl NightshadeRuntime {
         };
         let state_roots =
             Self::initialize_genesis_state_if_needed(store.clone(), home_dir, genesis);
-        let tries = ShardTries::new(
-            store.clone(),
-            genesis.config.num_block_producer_seats_per_shard.len() as NumShards,
-        );
+        let num_shards = genesis.config.num_block_producer_seats_per_shard.len() as NumShards;
+        let tries = ShardTries::new(store.clone(), num_shards);
         let epoch_manager = Arc::new(RwLock::new(
             EpochManager::new(
                 store.clone(),
@@ -220,6 +221,9 @@ impl NightshadeRuntime {
             genesis_config,
             genesis_runtime_config,
             store,
+            in_memory_contracts_per_shard: (0..num_shards)
+                .map(|_| InMemoryContracts::new(always_in_mem_contracts))
+                .collect(),
             tries,
             runtime,
             trie_viewer,
@@ -458,6 +462,7 @@ impl NightshadeRuntime {
                 &self.genesis_runtime_config,
                 current_protocol_version,
             ),
+            always_in_mem_contracts: self.in_memory_contracts_per_shard[shard_id as usize].clone(),
             cache: Some(Arc::new(StoreCompiledContractCache { store: self.store.clone() })),
             #[cfg(feature = "protocol_feature_evm")]
             evm_chain_id: self.evm_chain_id(),
@@ -1706,6 +1711,7 @@ mod test {
                 &genesis,
                 initial_tracked_accounts,
                 initial_tracked_shards,
+                &vec![],
             );
             let (_store, state_roots) = runtime.genesis_state();
             let genesis_hash = hash(&vec![0]);
