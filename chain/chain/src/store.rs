@@ -438,7 +438,36 @@ impl ChainStore {
             block_merkle_tree: SizedCache::with_size(CACHE_SIZE),
             block_ordinal_to_hash: SizedCache::with_size(CACHE_SIZE),
             processed_block_heights: SizedCache::with_size(CACHE_SIZE),
+            // update cache_reset() after adding new cache field
         }
+    }
+
+    pub fn cache_reset(&mut self) {
+        self.blocks.cache_reset();
+        self.headers.cache_reset();
+        self.chunks.cache_reset();
+        self.partial_chunks.cache_reset();
+        self.block_extras.cache_reset();
+        self.chunk_extras.cache_reset();
+        self.height.cache_reset();
+        self.block_hash_per_height.cache_reset();
+        self.block_refcounts.cache_reset();
+        self.chunk_hash_per_height_shard.cache_reset();
+        self.next_block_hashes.cache_reset();
+        self.epoch_light_client_blocks.cache_reset();
+        self.my_last_approvals.cache_reset();
+        self.last_approvals_per_account.cache_reset();
+        self.outgoing_receipts.cache_reset();
+        self.incoming_receipts.cache_reset();
+        self.invalid_chunks.cache_reset();
+        self.receipt_id_to_shard_id.cache_reset();
+        self.next_block_with_new_chunk.cache_reset();
+        self.last_block_with_new_chunk.cache_reset();
+        self.transactions.cache_reset();
+        self.receipts.cache_reset();
+        self.block_merkle_tree.cache_reset();
+        self.block_ordinal_to_hash.cache_reset();
+        self.processed_block_heights.cache_reset();
     }
 
     pub fn owned_store(&self) -> Arc<Store> {
@@ -1743,9 +1772,14 @@ impl<'a> ChainStoreUpdate<'a> {
         // Bowen: It seems that height_to_hashes is used to update ColBlockHeight, which stores blocks,
         // not block headers, by height. Therefore I wonder whether this line here breaks some invariant
         // since now we potentially don't have the corresponding block in storage.
+        //
+        // KPR: `height_to_hashes` and `next_block_hashes` are updated in update_height_if_not_challenged
+        // and related to Headers, not Blocks.
 
-        //self.chain_tore_cache_update.height_to_hashes.insert(t.height, Some(t.last_block_hash));
-        //self.chain_store_cache_update.next_block_hashes.insert(t.prev_block_hash, t.last_block_hash);
+        self.chain_store_cache_update.height_to_hashes.insert(t.height, Some(t.last_block_hash));
+        self.chain_store_cache_update
+            .next_block_hashes
+            .insert(t.prev_block_hash, t.last_block_hash);
         self.header_head = Some(t.clone());
         Ok(())
     }
@@ -2018,6 +2052,12 @@ impl<'a> ChainStoreUpdate<'a> {
         }
     }
 
+    pub fn reset_head(&mut self) {
+        self.head = None;
+        self.header_head = None;
+        self.final_head = None;
+    }
+
     pub fn reset_tail(&mut self) {
         self.tail = None;
         self.chunk_tail = None;
@@ -2047,6 +2087,10 @@ impl<'a> ChainStoreUpdate<'a> {
         self.chunk_tail = Some(height);
     }
 
+    pub fn cache_reset(&mut self) {
+        self.chain_store.cache_reset();
+    }
+
     pub fn clear_chunk_data_and_headers(
         &mut self,
         min_chunk_height: BlockHeight,
@@ -2073,10 +2117,9 @@ impl<'a> ChainStoreUpdate<'a> {
             }
 
             let header_hashes = self.get_all_header_hashes_by_height(height)?;
-            for _header_hash in header_hashes {
+            for header_hash in header_hashes {
                 // 3. Delete header_hash-indexed data
-                // TODO #3488: enable
-                //self.gc_col(ColBlockHeader, &header_hash.into());
+                self.gc_col(ColBlockHeader, &header_hash.into());
             }
 
             // 4. Delete chunks_tail-related data
@@ -2372,10 +2415,8 @@ impl<'a> ChainStoreUpdate<'a> {
                 store_update.delete(col, key);
             }
             DBCol::ColBlockHeader => {
-                // TODO #3488
                 store_update.delete(col, key);
                 self.chain_store.headers.cache_remove(key);
-                unreachable!();
             }
             DBCol::ColBlock => {
                 store_update.delete(col, key);

@@ -8,6 +8,7 @@ use chrono::Utc;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use strum::IntoEnumIterator;
 use tracing::{debug, error, info, warn};
 
 use crate::lightclient::get_epoch_block_producers_view;
@@ -26,11 +27,13 @@ use crate::{metrics, DoomslugThresholdMode};
 
 use near_chain_primitives::error::{Error, ErrorKind, LogTransientStorageError};
 use near_primitives::block::{genesis_chunks, Tip};
+use near_primitives::block_header::{Approval, ApprovalInner, BlockHeaderInnerLite};
 use near_primitives::challenge::{
     BlockDoubleSign, Challenge, ChallengeBody, ChallengesResult, ChunkProofs, ChunkState,
     MaybeEncodedShardChunk, SlashedValidator,
 };
 use near_primitives::checked_feature;
+use near_primitives::epoch_manager::BlockInfo;
 use near_primitives::hash::{hash, CryptoHash};
 use near_primitives::merkle::{
     combine_hash, merklize, verify_path, Direction, MerklePath, MerklePathItem,
@@ -56,7 +59,10 @@ use near_primitives::views::{
     FinalExecutionOutcomeWithReceiptView, FinalExecutionStatus, LightClientBlockView,
     SignedTransactionView,
 };
-use near_store::{ColState, ColStateHeaders, ColStateParts, ShardTries, StoreUpdate};
+use near_store::{
+    ColState, ColStateHeaders, ColStateParts, DBCol, ShardTries, StoreUpdate, HEAD_KEY,
+    SHOULD_COL_GC,
+};
 
 #[cfg(feature = "delay_detector")]
 use delay_detector::DelayDetector;
@@ -244,8 +250,11 @@ impl Chain {
         doomslug_threshold_mode: DoomslugThresholdMode,
     ) -> Result<Chain, Error> {
         // Get runtime initial state and create genesis block out of it.
+        println!("HERE1");
         let (store, state_roots) = runtime_adapter.genesis_state();
+        println!("HERE2");
         let mut store = ChainStore::new(store, chain_genesis.height);
+        println!("HERE3");
         let genesis_chunks = genesis_chunks(
             state_roots.clone(),
             runtime_adapter.num_shards(),
@@ -253,6 +262,7 @@ impl Chain {
             chain_genesis.height,
             chain_genesis.protocol_version,
         );
+        println!("HERE4");
         let genesis = Block::genesis(
             chain_genesis.protocol_version,
             genesis_chunks.iter().map(|chunk| chunk.cloned_header()).collect(),
@@ -262,13 +272,17 @@ impl Chain {
             chain_genesis.total_supply,
             Chain::compute_bp_hash(&*runtime_adapter, EpochId::default(), &CryptoHash::default())?,
         );
+        println!("HERE5");
 
         // Check if we have a head in the store, otherwise pick genesis block.
         let mut store_update = store.store_update();
+        println!("HERE6");
         let head_res = store_update.head();
+        println!("HERE7 {:?}", head_res);
         let head: Tip;
         match head_res {
             Ok(h) => {
+                println!("-HERE1");
                 head = h;
 
                 // Check that genesis in the store is the same as genesis given in the config.
@@ -292,9 +306,11 @@ impl Chain {
             }
             Err(err) => match err.kind() {
                 ErrorKind::DBNotFoundErr(_) => {
+                    println!("-HERE2");
                     for chunk in genesis_chunks {
                         store_update.save_chunk(chunk.clone());
                     }
+                    println!("HERE3");
                     store_update.merge(runtime_adapter.add_validator_proposals(
                         BlockHeaderInfo::new(
                             &genesis.header(),
@@ -302,6 +318,7 @@ impl Chain {
                             chain_genesis.height,
                         ),
                     )?);
+                    println!("HERE4");
                     store_update.save_block_header(genesis.header().clone())?;
                     store_update.save_block(genesis.clone());
                     store_update.save_block_extra(
@@ -309,6 +326,7 @@ impl Chain {
                         BlockExtra { challenges_result: vec![] },
                     );
 
+                    println!("HERE5");
                     for (chunk_header, state_root) in
                         genesis.chunks().iter().zip(state_roots.iter())
                     {
@@ -326,6 +344,7 @@ impl Chain {
                         );
                     }
 
+                    println!("HERE6");
                     head = Tip::from_header(genesis.header());
                     store_update.save_head(&head)?;
                     store_update.save_final_head(&head)?;
@@ -775,6 +794,7 @@ impl Chain {
     pub fn sync_block_headers<F>(
         &mut self,
         mut headers: Vec<BlockHeader>,
+        is_epoch_sync: bool,
         on_challenge: F,
     ) -> Result<(), Error>
     where
@@ -798,6 +818,7 @@ impl Chain {
         if !all_known {
             // Validate header and then add to the chain.
             for header in headers.iter() {
+                debug!(target: "chain", "Sync block headers: syncing Header {} at Height {}", header.hash(), header.height());
                 let mut chain_update = self.chain_update();
 
                 match chain_update.check_header_known(header) {
@@ -807,29 +828,43 @@ impl Chain {
                         _ => return Err(e),
                     },
                 }
+                debug!(target: "chain", "Sync block headers: syncing Header {} at Height {}", header.hash(), header.height());
 
-                chain_update.validate_header(header, &Provenance::SYNC, on_challenge)?;
+                if !is_epoch_sync {
+                    chain_update.validate_header(header, &Provenance::SYNC, on_challenge)?;
+                } else {
+                    // The Header has been successfully validated by Epoch Sync validation procedure
+                }
                 chain_update.chain_store_update.save_block_header(header.clone())?;
 
-                // Add validator proposals for given header.
-                let last_finalized_height =
-                    chain_update.chain_store_update.get_block_height(&header.last_final_block())?;
-                let epoch_manager_update = chain_update.runtime_adapter.add_validator_proposals(
-                    BlockHeaderInfo::new(&header, last_finalized_height),
-                )?;
-                chain_update.chain_store_update.merge(epoch_manager_update);
+                if !is_epoch_sync {
+                    // Add validator proposals for given header.
+                    let last_finalized_height = chain_update
+                        .chain_store_update
+                        .get_block_height(&header.last_final_block())?;
+                    let epoch_manager_update =
+                        chain_update.runtime_adapter.add_validator_proposals(
+                            BlockHeaderInfo::new(&header, last_finalized_height),
+                        )?;
+                    chain_update.chain_store_update.merge(epoch_manager_update);
+                }
                 chain_update.commit()?;
             }
         }
+        if !is_epoch_sync {
+            debug!(target: "chain", "Sync block headers: done, updating header_head if possible");
 
-        let mut chain_update = self.chain_update();
+            let mut chain_update = self.chain_update();
 
-        if let Some(header) = headers.last() {
-            // Update header_head if it's the new tip
-            chain_update.update_header_head_if_not_challenged(header)?;
+            if let Some(header) = headers.last() {
+                // Update header_head if it's the new tip
+                chain_update.update_header_head_if_not_challenged(header)?;
+            }
+
+            chain_update.commit()
+        } else {
+            Ok(())
         }
-
-        chain_update.commit()
     }
 
     /// Returns if given block header is on the current chain.
@@ -931,9 +966,49 @@ impl Chain {
         store_update.delete_all(ColState);
         chain_store_update.merge(store_update);
 
-        // The reason to reset tail here is not to allow Tail be greater than Head
         chain_store_update.reset_tail();
         chain_store_update.commit()?;
+        Ok(())
+    }
+
+    pub fn reset_data(&mut self) -> Result<(), Error> {
+        info!(target: "chain", "Reset data");
+
+        // TODO fix me
+        /*let genesis_block_info: BlockInfo = self
+            .store
+            .owned_store()
+            .get_ser(DBCol::ColBlockInfo, &CryptoHash::default().try_to_vec()?)?
+            .unwrap();
+        info!(target: "chain", "genesis_block_info {:?}", genesis_block_info);*/
+
+        let tries = self.runtime_adapter.get_tries();
+        let mut chain_store_update = self.mut_store().store_update();
+        let mut store_update = StoreUpdate::new_with_tries(tries);
+
+        for col in DBCol::iter() {
+            if SHOULD_COL_GC[col as usize] {
+                store_update.delete_all(col);
+            }
+        }
+        //store_update.delete(DBCol::ColBlockMisc, HEAD_KEY);
+        chain_store_update.merge(store_update);
+
+        chain_store_update.cache_reset();
+
+        // TODO replace with reset all
+        chain_store_update.reset_head();
+        chain_store_update.reset_tail();
+        chain_store_update.commit()?;
+
+        /*let mut chain_store_update = self.mut_store().store_update();
+        let mut store_update = chain_store_update.store().store_update();
+        store_update
+            .set_ser(DBCol::ColBlockInfo, &CryptoHash::default().try_to_vec()?, &genesis_block_info)
+            .unwrap();
+        chain_store_update.merge(store_update);
+        chain_store_update.commit()?;*/
+
         Ok(())
     }
 
@@ -2032,6 +2107,70 @@ impl Chain {
             res.insert(shard_id, outcomes);
         }
         Ok(res)
+    }
+
+    /// Validate that the light client block is valid.
+    /// Follows the spec at https://nomicon.io/ChainSpec/LightClient.html
+    /// Doesn't check the height and the epoch ID conditions. Those checks must be performed by the caller.
+    pub fn validate_light_block_no_height_or_epoch_check(
+        light_block: &LightClientBlockView,
+        block_producers: &Vec<ValidatorStake>,
+    ) -> bool {
+        let LightClientBlockView {
+            prev_block_hash: _,
+            inner_lite,
+            inner_rest_hash,
+            next_block_inner_hash,
+            approvals_after_next,
+            next_bps,
+        } = light_block;
+
+        let inner_lite: BlockHeaderInnerLite = inner_lite.clone().into();
+        let inner_lite_hash = hash(&inner_lite.try_to_vec().unwrap());
+        let current_block_hash = combine_hash(inner_lite_hash, *inner_rest_hash);
+        let next_block_hash = combine_hash(*next_block_inner_hash, current_block_hash);
+
+        let approval_data_serialized_for_sig = Approval::get_data_for_sig(
+            &ApprovalInner::Endorsement(next_block_hash),
+            inner_lite.height + 2,
+        );
+
+        let mut total_stake = 0;
+        let mut approved_stake = 0;
+        for (maybe_signature, block_producer) in approvals_after_next.iter().zip(block_producers) {
+            total_stake += block_producer.stake;
+
+            match maybe_signature {
+                None => continue,
+                Some(signature) => {
+                    approved_stake += block_producer.stake;
+                    if !signature.verify(
+                        approval_data_serialized_for_sig.as_ref(),
+                        &block_producer.public_key,
+                    ) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        let threshold = total_stake * 2 / 3;
+        if approved_stake <= threshold {
+            return false;
+        }
+
+        if let Some(next_bps) = next_bps {
+            if Chain::compute_bp_hash_inner(
+                next_bps.into_iter().map(|x| x.clone().into()).collect(),
+            )
+            .unwrap()
+                != inner_lite.next_bp_hash
+            {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
