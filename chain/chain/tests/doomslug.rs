@@ -3,7 +3,7 @@
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use rand::{thread_rng, Rng};
 
@@ -11,6 +11,7 @@ mod tests {
     use near_crypto::{KeyType, SecretKey};
     use near_primitives::block::Approval;
     use near_primitives::hash::{hash, CryptoHash};
+    use near_primitives::time::{Instant, Time};
     use near_primitives::types::{ApprovalStake, BlockHeight};
     use near_primitives::validator_signer::InMemoryValidatorSigner;
 
@@ -75,7 +76,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut now = Instant::now();
+        let mut now = Instant::now_in_test();
         let started = now;
 
         let gst = now + time_to_gst;

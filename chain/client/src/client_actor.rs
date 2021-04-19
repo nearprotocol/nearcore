@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use actix::{Actor, Addr, Arbiter, Context, Handler};
 use actix_rt::ArbiterHandle;
+use chrono::DateTime;
 use chrono::Duration as OldDuration;
-use chrono::{DateTime, Utc};
 use log::{debug, error, info, trace, warn};
 
 #[cfg(feature = "delay_detector")]
@@ -37,6 +37,9 @@ use near_performance_metrics;
 use near_performance_metrics_macros::{perf, perf_with_debug};
 use near_primitives::hash::CryptoHash;
 use near_primitives::network::{AnnounceAccount, PeerId};
+#[cfg(feature = "adversarial")]
+use near_primitives::time::TimeTravelSingleton;
+use near_primitives::time::{Instant, InstantProxy, Time, Utc, UtcProxy};
 use near_primitives::types::{BlockHeight, EpochId};
 use near_primitives::unwrap_or_return;
 use near_primitives::utils::{from_timestamp, MaybeValidated};
@@ -95,7 +98,8 @@ pub struct ClientActor {
 fn wait_until_genesis(genesis_time: &DateTime<Utc>) {
     loop {
         // Get chrono::Duration::num_seconds() by deducting genesis_time from now.
-        let duration = genesis_time.signed_duration_since(Utc::now());
+        // Waiting until genesis may appear in integration testing. We use the time proxy.
+        let duration = genesis_time.signed_duration_since(UtcProxy::now());
         let chrono_seconds = duration.num_seconds();
         // Check if number of seconds in chrono::Duration larger than zero.
         if chrono_seconds <= 0 {
@@ -137,7 +141,8 @@ impl ClientActor {
             enable_doomslug,
         )?;
 
-        let now = Utc::now();
+        // The time influences timers. We do not use the time proxy.
+        let now = Utc::system_time();
         Ok(ClientActor {
             #[cfg(feature = "adversarial")]
             adv,
@@ -289,6 +294,15 @@ impl Handler<NetworkClientMessages> for ClientActor {
                         } else {
                             NetworkClientResponses::AdvResult(store_validator.tests_done())
                         }
+                    }
+                    NetworkAdversarialMessage::AdvTimeTravel(payload) => {
+                        TimeTravelSingleton::set(TimeTravelSingleton {
+                            last_check_utc: ::chrono::Utc::now(),
+                            last_check_instant: ::std::time::Instant::now(),
+                            diff: payload.diff,
+                            rate: payload.rate,
+                        });
+                        NetworkClientResponses::NoResponse
                     }
                     _ => panic!("invalid adversary message"),
                 };
@@ -542,7 +556,8 @@ impl Handler<Status> for ClientActor {
         let header = self.client.chain.get_block_header(&head.last_block_hash)?;
         let latest_block_time = header.raw_timestamp().clone();
         if msg.is_health_check {
-            let now = Utc::now();
+            // The current time influences reported status. We use the time proxy.
+            let now = UtcProxy::now();
             let block_timestamp = from_timestamp(latest_block_time);
             if now > block_timestamp {
                 let elapsed = (now - block_timestamp).to_std().unwrap();
@@ -652,7 +667,7 @@ impl ClientActor {
             Some(signer) => signer,
         };
 
-        let now = Instant::now();
+        let now = Instant::system_time();
         // Check that we haven't announced it too recently
         if let Some(last_validator_announce_time) = self.last_validator_announce_time {
             // Don't make announcement if have passed less than half of the time in which other peers
@@ -720,8 +735,11 @@ impl ClientActor {
                 let have_all_chunks =
                     head.height == 0 || num_chunks == self.client.runtime_adapter.num_shards();
 
+                // Here the time argument may be compared against time passed to
+                // `doomslug.on_approval_message` for determining readiness to produce
+                // a new block. We use a time proxy.
                 if self.client.doomslug.ready_to_produce_block(
-                    Instant::now(),
+                    InstantProxy::now(),
                     height,
                     have_all_chunks,
                 ) {
@@ -753,7 +771,10 @@ impl ClientActor {
         let _d = DelayDetector::new("client triggers".into());
 
         let mut delay = Duration::from_secs(1);
-        let now = Utc::now();
+        // The current time measurement influences only the delay for `run_later`.
+        // It does not influence decisions or cause side-effects. So go directly
+        // to system time, without the time proxy.
+        let now = Utc::system_time();
 
         if self.sync_started {
             self.doomslug_timer_next_attempt = self.run_timer(
@@ -821,7 +842,9 @@ impl ClientActor {
     fn try_doomslug_timer(&mut self, _: &mut Context<ClientActor>) {
         let _ = self.client.check_and_update_doomslug_tip();
 
-        let approvals = self.client.doomslug.process_timer(Instant::now());
+        // Here we use a time proxy, because the argument drives the timing of approvals,
+        // and does not participate in the timing of the next run of the timer.
+        let approvals = self.client.doomslug.process_timer(InstantProxy::now());
 
         // Important to save the largest approval target height before sending approvals, so
         // that if the node crashes in the meantime, we cannot get slashed on recovery
@@ -1205,7 +1228,11 @@ impl ClientActor {
     where
         F: FnOnce(&mut Self, &mut <Self as Actor>::Context) + 'static,
     {
-        let now = Utc::now();
+        // The current time measurement is for a timer.
+        // It does not influence decisions or cause side-effects. So go directly
+        // to system time, without the time proxy.
+        // Furthermore, the `next_attempt` parameter comes from system time.
+        let now = Utc::system_time();
         if now < next_attempt {
             return next_attempt;
         }

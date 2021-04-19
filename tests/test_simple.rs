@@ -3,8 +3,9 @@
 #[cfg(feature = "expensive_tests")]
 mod test {
     use near_logger_utils::init_integration_logger;
+    use near_primitives::time::{Instant, Time};
     use near_primitives::transaction::SignedTransaction;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use testlib::node::{create_nodes, sample_two_nodes, Node};
     use testlib::test_helpers::{heavy_test, wait};
 
@@ -21,7 +22,7 @@ mod test {
         }
 
         // waiting for nodes to be synced
-        let started = Instant::now();
+        let started = Instant::now_in_test();
         loop {
             if started.elapsed() > Duration::from_secs(10) {
                 panic!("nodes are not synced in 10s");

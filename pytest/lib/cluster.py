@@ -847,8 +847,11 @@ def start_cluster(num_nodes,
     proxy = NodesProxy(message_handler) if message_handler is not None else None
 
     def spin_up_node_and_push(i, boot_key, boot_addr):
+        # Start proxy right away (skip_starting_proxy=False):
+        # proxy must spin up ASAP because connections may be initiated early.
+        # We want to accept these connections.
         node = spin_up_node(config, near_root, node_dirs[i], i, boot_key,
-                            boot_addr, [], proxy, skip_starting_proxy=True)
+                            boot_addr, [], proxy, skip_starting_proxy=False)
         while len(ret) < i:
             time.sleep(0.01)
         ret.append(node)
@@ -866,9 +869,6 @@ def start_cluster(num_nodes,
 
     for handle in handles:
         handle.join()
-
-    for node in ret:
-        node.start_proxy_if_needed()
 
     return ret
 
