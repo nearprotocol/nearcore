@@ -516,6 +516,43 @@ impl CompiledContractCache for StoreCompiledContractCache {
     }
 }
 
+/// Constant for the maximum number of heights back from the current height for which
+/// blockhashes will be served. (See usage in `BlockHashProvider` impl below).
+#[cfg(feature = "protocol_feature_block_hash_host_fn")]
+const MAX_HEIGHT_HISTORY: u64 = 256;
+
+/// Structure for fulfilling the `BlockHashProvider` interface using a DB look up.
+#[cfg(feature = "protocol_feature_block_hash_host_fn")]
+pub struct StoreBlockHashProvider {
+    store: Arc<Store>,
+    current_block_height: near_primitives::types::BlockHeight,
+}
+
+#[cfg(feature = "protocol_feature_block_hash_host_fn")]
+impl StoreBlockHashProvider {
+    pub fn new(
+        store: Arc<Store>,
+        current_block_height: near_primitives::types::BlockHeight,
+    ) -> Self {
+        Self { store, current_block_height }
+    }
+}
+
+#[cfg(feature = "protocol_feature_block_hash_host_fn")]
+impl near_primitives::types::BlockHashProvider for StoreBlockHashProvider {
+    fn block_hash(
+        &self,
+        height: near_primitives::types::BlockHeight,
+    ) -> Result<Option<CryptoHash>, std::io::Error> {
+        if height >= self.current_block_height
+            || height < self.current_block_height.saturating_sub(MAX_HEIGHT_HISTORY)
+        {
+            return Ok(None);
+        }
+        self.store.get_ser(DBCol::ColBlockHeight, &near_primitives::utils::index_to_bytes(height))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

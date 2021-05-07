@@ -21,6 +21,9 @@ use near_store::{get_code, TrieUpdate, TrieUpdateValuePtr};
 use near_vm_errors::{HostError, InconsistentStateError, VMLogicError};
 use near_vm_logic::{External, ValuePtr};
 
+#[cfg(feature = "protocol_feature_block_hash_host_fn")]
+use near_primitives::types::{BlockHashProvider, BlockHeight};
+
 pub struct RuntimeExt<'a> {
     trie_update: &'a mut TrieUpdate,
     account_id: &'a AccountId,
@@ -35,6 +38,8 @@ pub struct RuntimeExt<'a> {
     last_block_hash: &'a CryptoHash,
     epoch_info_provider: &'a dyn EpochInfoProvider,
     current_protocol_version: ProtocolVersion,
+    #[cfg(feature = "protocol_feature_block_hash_host_fn")]
+    block_hash_provider: &'a dyn BlockHashProvider,
 }
 
 pub struct RuntimeExtValuePtr<'a>(TrieUpdateValuePtr<'a>);
@@ -62,6 +67,8 @@ impl<'a> RuntimeExt<'a> {
         last_block_hash: &'a CryptoHash,
         epoch_info_provider: &'a dyn EpochInfoProvider,
         current_protocol_version: ProtocolVersion,
+        #[cfg(feature = "protocol_feature_block_hash_host_fn")] // comment because rustfmt bug
+        block_hash_provider: &'a dyn BlockHashProvider,
     ) -> Self {
         RuntimeExt {
             trie_update,
@@ -77,6 +84,8 @@ impl<'a> RuntimeExt<'a> {
             last_block_hash,
             epoch_info_provider,
             current_protocol_version,
+            #[cfg(feature = "protocol_feature_block_hash_host_fn")]
+            block_hash_provider,
         }
     }
 
@@ -383,5 +392,12 @@ impl<'a> External for RuntimeExt<'a> {
         self.epoch_info_provider
             .validator_total_stake(self.epoch_id, self.last_block_hash)
             .map_err(|e| ExternalError::ValidatorError(e).into())
+    }
+
+    #[cfg(feature = "protocol_feature_block_hash_host_fn")]
+    fn block_hash(&self, block_height: BlockHeight) -> ExtResult<Option<CryptoHash>> {
+        self.block_hash_provider
+            .block_hash(block_height)
+            .map_err(|_| ExternalError::StorageError(StorageError::StorageInternalError).into())
     }
 }

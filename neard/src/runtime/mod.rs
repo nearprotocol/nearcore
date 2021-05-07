@@ -55,6 +55,9 @@ use node_runtime::{
     ValidatorAccountsUpdate,
 };
 
+#[cfg(feature = "protocol_feature_block_hash_host_fn")]
+use near_store::StoreBlockHashProvider;
+
 use crate::shard_tracker::{account_id_to_shard_id, ShardTracker};
 use near_primitives::runtime::config::RuntimeConfig;
 
@@ -395,6 +398,9 @@ impl NightshadeRuntime {
         let epoch_id = self.get_epoch_id_from_prev_block(prev_block_hash)?;
         let current_protocol_version = self.get_epoch_protocol_version(&epoch_id)?;
 
+        #[cfg(feature = "protocol_feature_block_hash_host_fn")]
+        let block_hash_provider =
+            StoreBlockHashProvider::new(Arc::clone(&self.store), block_height);
         let apply_state = ApplyState {
             block_index: block_height,
             prev_block_hash: *prev_block_hash,
@@ -415,6 +421,8 @@ impl NightshadeRuntime {
             #[cfg(feature = "protocol_feature_evm")]
             evm_chain_id: self.evm_chain_id(),
             profile: Default::default(),
+            #[cfg(feature = "protocol_feature_block_hash_host_fn")]
+            block_hash_provider: Arc::new(block_hash_provider),
         };
 
         let apply_result = self
@@ -1527,6 +1535,8 @@ impl node_runtime::adapter::ViewRuntimeAdapter for NightshadeRuntime {
         #[cfg(feature = "protocol_feature_evm")] evm_chain_id: u64,
     ) -> Result<Vec<u8>, node_runtime::state_viewer::errors::CallFunctionError> {
         let state_update = self.get_tries().new_trie_update_view(shard_id, state_root);
+        #[cfg(feature = "protocol_feature_block_hash_host_fn")]
+        let block_hash_provider = StoreBlockHashProvider::new(self.tries.get_store(), height);
         let view_state = ViewApplyState {
             block_height: height,
             prev_block_hash: *prev_block_hash,
@@ -1538,6 +1548,8 @@ impl node_runtime::adapter::ViewRuntimeAdapter for NightshadeRuntime {
             cache: Some(Arc::new(StoreCompiledContractCache { store: self.tries.get_store() })),
             #[cfg(feature = "protocol_feature_evm")]
             evm_chain_id,
+            #[cfg(feature = "protocol_feature_block_hash_host_fn")]
+            block_hash_provider: Arc::new(block_hash_provider),
         };
         self.trie_viewer.call_function(
             state_update,

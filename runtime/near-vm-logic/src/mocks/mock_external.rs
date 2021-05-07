@@ -211,6 +211,14 @@ impl External for MockedExternal {
     fn validator_total_stake(&self) -> Result<Balance> {
         Ok(self.validators.values().sum())
     }
+
+    #[cfg(feature = "protocol_feature_block_hash_host_fn")]
+    fn block_hash(
+        &self,
+        _block_height: near_primitives_core::types::BlockHeight,
+    ) -> Result<Option<near_primitives::hash::CryptoHash>> {
+        Ok(None)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
