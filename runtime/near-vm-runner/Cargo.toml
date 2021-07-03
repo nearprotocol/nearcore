@@ -16,14 +16,14 @@ This crate implements the specification of the interface that Near blockchain ex
 borsh = "0.8.1"
 serde = { version = "1", features = ["derive"] }
 wasmer-runtime = { version="0.17.1", features = ["default-backend-singlepass"], default-features = false, package = "wasmer-runtime-near", optional = true }
-# Always used even for wasmer 1.0 for validating wasm, will be replaced when refactor prepare.rs
+# Always used even for wasmer 2.0 for validating wasm, will be replaced when refactor prepare.rs
 wasmer-runtime-core = {version = "0.17.3", package = "wasmer-runtime-core-near" }
-wasmer = { version = "1.0.2", optional = true }
-wasmer-types = { version = "1.0.2", optional = true }
-wasmer-compiler-singlepass = { version = "1.0.2", optional = true, default-features = false, features = ["std", "enable-serde"] } # disable `rayon` feature.
-wasmer-compiler-cranelift = { version = "1.0.2", optional = true }
-wasmer-engine-native = { version = "1.0.2", optional = true }
-wasmer-vm = "1.0.2"
+wasmer = { version = "2.0.0", optional = true }
+wasmer-types = { version = "2.0.0", optional = true }
+wasmer-compiler-singlepass = { version = "2.0.0", optional = true, default-features = false, features = ["std"] } # disable `rayon` feature.
+wasmer-compiler-cranelift = { version = "2.0.0", optional = true }
+wasmer-engine-dylib = { version = "2.0.0", optional = true }
+wasmer-vm = "2.0.0"
 pwasm-utils = "0.12"
 parity-wasm = "0.41"
 wasmtime = { version = "0.25.0", default-features = false, optional = true }
@@ -35,6 +35,7 @@ near-evm-runner = { path = "../near-evm-runner", optional = true }
 cached = "0.23.0"
 tracing = { version = "0.1", default-features = false }
 threadpool = "1.8.1"
+once_cell = { version = "1", optional = true }
 
 [dev-dependencies]
 near-test-contracts = { path = "../near-test-contracts" }
@@ -45,14 +46,14 @@ base64 = "0.13"
 
 [features]
 # all vms enabled for tests, but only one default vm, specified by runtime crate
-default = ["wasmer0_vm", "wasmtime_vm", "wasmer1_vm"]
-wasmer0_vm = [ "wasmer-runtime" ]
+default = ["wasmer0_vm", "wasmtime_vm", "wasmer2_vm"]
+wasmer0_vm = [ "wasmer-runtime", "once_cell" ]
 wasmtime_vm = [ "wasmtime", "anyhow"]
-wasmer1_vm = [ "wasmer", "wasmer-types", "wasmer-compiler-singlepass",  "wasmer-compiler-cranelift", "wasmer-engine-native", ]
+wasmer2_vm = [ "wasmer", "wasmer-types", "wasmer-compiler-singlepass",  "wasmer-compiler-cranelift", "wasmer-engine-dylib", ]
 
 wasmer0_default = []
 wasmtime_default = []
-wasmer1_default = []
+wasmer2_default = []
 
 lightbeam = ["wasmtime/lightbeam"]
 no_cpu_compatibility_checks = []
