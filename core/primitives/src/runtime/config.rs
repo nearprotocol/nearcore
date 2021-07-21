@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::checked_feature;
-use crate::config::VMConfig;
+use crate::config::{ExtCostsConfig, VMConfig};
 use crate::runtime::fees::RuntimeFeesConfig;
 use crate::serialize::u128_dec_format;
 use crate::types::{AccountId, Balance, Gas};
@@ -62,6 +62,9 @@ pub struct ActualRuntimeConfig {
 
     /// The runtime configuration with lower storage cost adjustment applied.
     with_lower_storage_cost: Arc<RuntimeConfig>,
+
+    /// The runtime configuration with fees updated at the time of adding precompilation.
+    precompilation_protocol_config: Arc<RuntimeConfig>,
 }
 
 impl ActualRuntimeConfig {
@@ -78,9 +81,14 @@ impl ActualRuntimeConfig {
 
         // Adjust as per LowerStorageCost protocol feature.
         config.storage_amount_per_byte = 10u128.pow(19);
-        let with_lower_storage_cost = Arc::new(config);
+        let with_lower_storage_cost = Arc::new(config.clone());
 
-        Self { runtime_config, with_lower_storage_cost }
+        // Adjust transaction costs at the time of adding precompilation.
+        config.wasm_config.ext_costs = ExtCostsConfig::default();
+        config.transaction_costs = RuntimeFeesConfig::default();
+        let precompilation_protocol_config = Arc::new(config);
+
+        Self { runtime_config, with_lower_storage_cost, precompilation_protocol_config }
     }
 
     /// Returns a `RuntimeConfig` for the corresponding protocol version.
@@ -89,7 +97,13 @@ impl ActualRuntimeConfig {
     /// still return configuration which differs from configuration found in
     /// genesis file by the `max_gas_burnt_view` limit.
     pub fn for_protocol_version(&self, protocol_version: ProtocolVersion) -> &Arc<RuntimeConfig> {
-        if checked_feature!("stable", LowerStorageCost, protocol_version) {
+        if checked_feature!(
+            "protocol_feature_precompile_contracts",
+            PrecompileContracts,
+            protocol_version
+        ) {
+            &self.precompilation_protocol_config
+        } else if checked_feature!("stable", LowerStorageCost, protocol_version) {
             &self.with_lower_storage_cost
         } else {
             &self.runtime_config
@@ -119,10 +133,12 @@ impl Default for AccountCreationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::version::PROTOCOL_VERSION;
 
     #[test]
     fn test_max_prepaid_gas() {
         let config = RuntimeConfig::default();
+        eprintln!("{} {}", config.wasm_config.limit_config.max_total_prepaid_gas, config.transaction_costs.min_receipt_with_function_call_gas());
         assert!(
             config.wasm_config.limit_config.max_total_prepaid_gas
                 / config.transaction_costs.min_receipt_with_function_call_gas()
@@ -146,5 +162,26 @@ mod tests {
     fn test_max_gas_burnt_view() {
         let config = ActualRuntimeConfig::new(RuntimeConfig::default(), Some(42));
         assert_eq!(42, config.for_protocol_version(0).wasm_config.limit_config.max_gas_burnt_view);
+    }
+
+    #[test]
+    fn test_after_precompile_contract() {
+        let mut config = RuntimeConfig::default();
+        config.wasm_config.ext_costs.contract_compile_base = 100;
+        config.wasm_config.ext_costs.contract_compile_bytes = 10;
+        let config = ActualRuntimeConfig::new(config, None);
+
+        let new_cfg = config.for_protocol_version(PROTOCOL_VERSION);
+        if checked_feature!(
+            "protocol_feature_precompile_contracts",
+            PrecompileContracts,
+            PROTOCOL_VERSION
+        ) {
+            assert_eq!(new_cfg.wasm_config.ext_costs.contract_compile_base, 0);
+            assert_eq!(new_cfg.wasm_config.ext_costs.contract_compile_bytes, 0);
+        } else {
+            assert_eq!(new_cfg.wasm_config.ext_costs.contract_compile_base, 100);
+            assert_eq!(new_cfg.wasm_config.ext_costs.contract_compile_bytes, 10);
+        }
     }
 }

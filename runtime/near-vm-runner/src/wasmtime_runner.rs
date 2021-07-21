@@ -194,6 +194,7 @@ pub mod wasmtime_runner {
                 ))),
             );
         }
+
         // Unfortunately, due to the Wasmtime implementation we have to do tricks with the
         // lifetimes of the logic instance and pass raw pointers here.
         let raw_logic = &mut logic as *mut _ as *mut c_void;
