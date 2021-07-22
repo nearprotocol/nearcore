@@ -1022,7 +1022,6 @@ pub struct ExecutionOutcomeView {
     /// Execution status. Contains the result in case of successful execution.
     pub status: ExecutionStatusView,
     /// Execution metadata, versioned
-    #[serde(skip)]
     pub metadata: ExecutionMetadata,
 }
 
