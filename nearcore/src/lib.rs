@@ -303,6 +303,15 @@ pub fn start_with_config(
         #[cfg(feature = "adversarial")]
         adv.clone(),
     );
+    let arbiter = Arbiter::new();
+    let client_actor1 = client_actor.clone().recipient();
+    let view_client1 = view_client.clone().recipient();
+    config.network_config.verify();
+    let network_config = config.network_config;
+    let network_actor = PeerManagerActor::start_in_arbiter(&arbiter.handle(), move |_ctx| {
+        PeerManagerActor::new(store, network_config, client_actor1, view_client1).unwrap()
+    });
+
     #[cfg(feature = "json_rpc")]
     if let Some(rpc_config) = config.rpc_config {
         near_jsonrpc::start_http(
@@ -310,6 +319,7 @@ pub fn start_with_config(
             config.genesis.config.clone(),
             client_actor.clone(),
             view_client.clone(),
+            network_actor.clone(),
         );
     }
     #[cfg(feature = "rosetta_rpc")]
@@ -321,18 +331,6 @@ pub fn start_with_config(
             view_client.clone(),
         );
     }
-
-    config.network_config.verify();
-
-    let arbiter = Arbiter::new();
-
-    let client_actor1 = client_actor.clone().recipient();
-    let view_client1 = view_client.clone().recipient();
-    let network_config = config.network_config;
-
-    let network_actor = PeerManagerActor::start_in_arbiter(&arbiter.handle(), move |_ctx| {
-        PeerManagerActor::new(store, network_config, client_actor1, view_client1).unwrap()
-    });
 
     network_adapter.set_recipient(network_actor.recipient());
 

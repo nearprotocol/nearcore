@@ -107,6 +107,8 @@ pub enum ProtocolFeature {
     AltBn128,
     #[cfg(feature = "protocol_feature_restore_receipts_after_fix")]
     RestoreReceiptsAfterFix,
+    #[cfg(feature = "protocol_feature_routing_exchange_algorithm")]
+    RoutingExchangeAlgorithm,
 }
 
 /// Current latest stable version of the protocol.
@@ -117,7 +119,7 @@ pub const PROTOCOL_VERSION: ProtocolVersion = 46;
 
 /// Current latest nightly version of the protocol.
 #[cfg(feature = "nightly_protocol")]
-pub const PROTOCOL_VERSION: ProtocolVersion = 114;
+pub const PROTOCOL_VERSION: ProtocolVersion = 115;
 
 impl ProtocolFeature {
     pub const fn protocol_version(self) -> ProtocolVersion {
@@ -136,6 +138,8 @@ impl ProtocolFeature {
             ProtocolFeature::CountRefundReceiptsInGasLimit => 46,
             ProtocolFeature::MathExtension => 46,
 
+            #[cfg(feature = "protocol_feature_routing_exchange_algorithm")]
+            ProtocolFeature::RoutingExchangeAlgorithm => 100,
             // Nightly features
             #[cfg(feature = "protocol_feature_evm")]
             ProtocolFeature::EVM => 103,
@@ -145,6 +149,8 @@ impl ProtocolFeature {
             ProtocolFeature::BlockHeaderV3 => 109,
             #[cfg(feature = "protocol_feature_restore_receipts_after_fix")]
             ProtocolFeature::RestoreReceiptsAfterFix => 112,
+            #[cfg(feature = "protocol_feature_routing_exchange_algorithm")]
+            ProtocolFeature::RoutingExchangeAlgorithm => 115,
         }
     }
 }
